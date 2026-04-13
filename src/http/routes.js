@@ -153,6 +153,16 @@ router.post('/session/start', requireControlAuth, asyncRoute(async (req, res) =>
     throw error;
   }
 
+  const responsePayload = {
+    sessionId: runtime.session.sessionId,
+    joinUrl: buildServerJoinUrl(req, runtime.session.sessionId),
+    playerCount: runtime.session.initialExpectedPlayerCount,
+    stakeAmount: runtime.session.stakeAmount,
+    status: runtime.session.status,
+    firstJoinTimeoutMs: config.devWaitForAllPlayers ? null : config.firstJoinTimeoutMs,
+    devWaitForAllPlayers: config.devWaitForAllPlayers
+  };
+
   await dispatchWebhook(
     WebhookEventType.SESSION_CREATED,
     buildSessionCreatedPayload({
@@ -163,15 +173,6 @@ router.post('/session/start', requireControlAuth, asyncRoute(async (req, res) =>
     })
   );
 
-  const responsePayload = {
-    sessionId: runtime.session.sessionId,
-    joinUrl: buildServerJoinUrl(req, runtime.session.sessionId),
-    playerCount: runtime.session.initialExpectedPlayerCount,
-    stakeAmount: runtime.session.stakeAmount,
-    status: runtime.session.status,
-    firstJoinTimeoutMs: config.devWaitForAllPlayers ? null : config.firstJoinTimeoutMs,
-    devWaitForAllPlayers: config.devWaitForAllPlayers
-  };
   const signature = signJsonPayload(responsePayload);
   if (signature) {
     res.set('X-Hub-Signature-256', signature);

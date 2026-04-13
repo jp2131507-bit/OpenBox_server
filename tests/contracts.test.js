@@ -169,7 +169,88 @@ test('session start returns a signed response when control auth succeeds', async
   assert.equal(response.status, 201);
   assert.equal(payload.sessionId, 'session-created');
   assert.equal(payload.playerCount, 2);
+  assert.equal(payload.status, SessionStatus.WAITING_FOR_FIRST_JOIN);
   assert.match(response.headers.get('x-hub-signature-256') || '', /^[a-f0-9]{64}$/);
+});
+
+test('session start response keeps the initial waiting status even if runtime mutates during webhook delivery', async (t) => {
+  const previousControlToken = config.controlApiToken;
+  const previousHmacSecret = config.hmacSecret;
+  const previousEndpoints = config.webhookEndpoints;
+  const previousRetrySchedule = config.webhookRetryScheduleMs;
+  const previousMaxAttempts = config.maxWebhookAttempts;
+  const previousFetch = globalThis.fetch;
+  const originalCreateSession = sessionRegistry.createSession;
+
+  config.controlApiToken = 'secret-token';
+  config.hmacSecret = 'test-hmac-secret';
+  config.webhookEndpoints = ['http://webhook.test/events'];
+  config.webhookRetryScheduleMs = [0];
+  config.maxWebhookAttempts = 1;
+
+  let runtimeRef;
+  sessionRegistry.createSession = async () => {
+    runtimeRef = {
+      session: {
+        sessionId: 'session-created',
+        initialExpectedPlayerCount: 2,
+        currentExpectedPlayerCount: 2,
+        stakeAmount: 1000,
+        platformFeeType: 'percentage',
+        platformFeeValueSnapshot: 10,
+        registeredPlayerIds: ['p1', 'p2'],
+        roundCount: 1,
+        currentRoundId: 'round-1',
+        status: SessionStatus.WAITING_FOR_FIRST_JOIN
+      },
+      round: { roundId: 'round-1', roundNumber: 1, expectedPlayerCountForRound: 2 },
+      players: createRoundPlayers(['p1', 'p2'])
+    };
+    return runtimeRef;
+  };
+
+  const app = createTestApp();
+  const server = http.createServer(app);
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+
+  t.after(async () => {
+    config.controlApiToken = previousControlToken;
+    config.hmacSecret = previousHmacSecret;
+    config.webhookEndpoints = previousEndpoints;
+    config.webhookRetryScheduleMs = previousRetrySchedule;
+    config.maxWebhookAttempts = previousMaxAttempts;
+    globalThis.fetch = previousFetch;
+    sessionRegistry.createSession = originalCreateSession;
+    await new Promise((resolve) => server.close(resolve));
+  });
+
+  const address = server.address();
+  const port = typeof address === 'object' && address ? address.port : 0;
+  const baseUrl = `http://127.0.0.1:${port}`;
+  globalThis.fetch = async (url, options) => {
+    if (typeof url === 'string' && url.startsWith(baseUrl)) {
+      return previousFetch(url, options);
+    }
+    runtimeRef.session.status = SessionStatus.CANCELLED;
+    return { ok: true, status: 200 };
+  };
+
+  const response = await fetch(`${baseUrl}/session/start`, {
+    method: 'POST',
+    headers: {
+      authorization: 'Bearer secret-token',
+      'content-type': 'application/json'
+    },
+    body: JSON.stringify({
+      playerCount: 2,
+      stakeAmount: 1000,
+      playerIds: ['p1', 'p2']
+    })
+  });
+  const payload = await response.json();
+
+  assert.equal(response.status, 201);
+  assert.equal(payload.status, SessionStatus.WAITING_FOR_FIRST_JOIN);
 });
 
 test('session start rejects unauthorized requests when control auth is configured', async (t) => {
