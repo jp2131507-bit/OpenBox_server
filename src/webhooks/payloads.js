@@ -44,6 +44,17 @@ function sessionStatusLabel(status) {
   }
 }
 
+function lastRoundStatusLabel(status) {
+  switch (status) {
+    case 'ROUND_CANCELLED':
+      return 'cancelled';
+    case 'ROUND_ENDED':
+      return 'ended';
+    default:
+      return null;
+  }
+}
+
 function buildEnvelope(eventName, payload) {
   return {
     eventId: crypto.randomUUID(),
@@ -428,7 +439,9 @@ export function buildRoundCancelledPayload({
     endReason: round.roundEndReason || session.endReason || null,
     ...buildRoundCounts(session, round, players),
     minimumPlayersRequired,
-    players: (players || []).map((player) => buildPlayerMinimal(player))
+    players: (players || []).map((player) => buildPlayerMinimal(player)),
+    winners: [],
+    losers: []
   });
 }
 
@@ -504,7 +517,7 @@ export function buildSessionReplayStartedPayload({ eventName, session, round, pl
   });
 }
 
-export function buildSessionEndedPayload({ eventName, session, round }) {
+export function buildSessionEndedPayload({ eventName, session, round, lastRoundStatus = undefined }) {
   const economy = buildEconomy(session, round);
 
   return buildEnvelope(eventName, {
@@ -516,6 +529,7 @@ export function buildSessionEndedPayload({ eventName, session, round }) {
     roundCount: Number(session.roundCount || 0),
     lastRoundId: round?.roundId || null,
     lastRoundNumber: round?.roundNumber || null,
+    lastRoundStatus: lastRoundStatus ?? lastRoundStatusLabel(round?.status),
     stakeAmount: economy.stakeAmount,
     totalStakeAmount: economy.totalStakeAmount,
     platformFee: economy.platformFee,

@@ -56,6 +56,16 @@ const parseCsvInts = (value, fallback = []) => {
 const resolveTiming = (primaryName, legacyName, fallback) =>
   toInt(process.env[primaryName] ?? process.env[legacyName], fallback);
 
+const resolveDurationMsFromMinutes = (primaryName, legacyMsName, fallbackMs) => {
+  if (process.env[primaryName] != null && process.env[primaryName] !== '') {
+    return toInt(process.env[primaryName], Math.round(fallbackMs / 60000)) * 60000;
+  }
+  if (process.env[legacyMsName] != null && process.env[legacyMsName] !== '') {
+    return toInt(process.env[legacyMsName], fallbackMs);
+  }
+  return fallbackMs;
+};
+
 const resolveDurationMsFromSeconds = (primaryName, legacySecondsName, fallbackMs) => {
   if (process.env[primaryName] != null && process.env[primaryName] !== '') {
     return toInt(process.env[primaryName], fallbackMs);
@@ -103,7 +113,11 @@ export const config = {
   dlqSweepIntervalMs: toInt(process.env.DLQ_SWEEP_INTERVAL_MS, 60 * 60 * 1000),
   platformFeeType: (process.env.PLATFORM_FEE_TYPE || 'percentage').toLowerCase(),
   platformFeeValue: toFloat(process.env.PLATFORM_FEE_VALUE, 10),
-  sessionMaxLifetimeMs: toInt(process.env.SESSION_MAX_LIFETIME_MS, 60 * 60 * 1000)
+  sessionInactivityTimeoutMs: resolveDurationMsFromMinutes(
+    'SESSION_INACTIVITY_TIMEOUT_MS',
+    'SESSION_MAX_LIFETIME_MS',
+    60 * 60 * 1000
+  )
 };
 
 export default config;

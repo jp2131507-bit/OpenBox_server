@@ -11,6 +11,7 @@ import { RoundStatus, SessionStatus } from '../src/shared/protocol.js';
 import { validateStartPayload } from '../src/http/validation.js';
 import routes from '../src/http/routes.js';
 import {
+  buildRoundCancelledPayload,
   buildRoundEndedPayload,
   buildRoundStartedPayload,
   buildRoundSwapMatchedPayload,
@@ -581,6 +582,35 @@ test('buildRoundEndedPayload includes winners, losers, platform fee, and swap su
   assert.equal(payload.losers[0].playerId, 'p2');
 });
 
+test('buildRoundCancelledPayload stays lightweight and exposes empty winners and losers', () => {
+  const payload = buildRoundCancelledPayload({
+    eventName: 'round.cancelled',
+    session: {
+      sessionId: 's1',
+      registeredPlayerIds: ['p1', 'p2', 'p3']
+    },
+    round: {
+      roundId: 'r1',
+      roundNumber: 1,
+      expectedPlayerCountForRound: 3,
+      joinedPlayerIdsForRound: ['p1'],
+      roundEndReason: 'session_max_lifetime_exceeded'
+    },
+    players: [
+      { playerId: 'p1', playerName: 'Alice', hasJoinedRound: true },
+      { playerId: 'p2', playerName: 'Bob', hasJoinedRound: false }
+    ]
+  });
+
+  assert.equal(payload.eventName, 'round.cancelled');
+  assert.equal(payload.status, 'cancelled');
+  assert.equal(payload.players.length, 2);
+  assert.deepEqual(payload.winners, []);
+  assert.deepEqual(payload.losers, []);
+  assert.equal('boxes' in payload, false);
+  assert.equal('swapMatches' in payload, false);
+});
+
 test('buildSessionEndedPayload stays lightweight and references only the last round', () => {
   const payload = buildSessionEndedPayload({
     eventName: 'session.ended',
@@ -597,6 +627,7 @@ test('buildSessionEndedPayload stays lightweight and references only the last ro
     round: {
       roundId: 'r3',
       roundNumber: 3,
+      status: RoundStatus.ROUND_ENDED,
       grossStakeTotal: 5000,
       feeAmount: 500
     }
@@ -606,9 +637,71 @@ test('buildSessionEndedPayload stays lightweight and references only the last ro
   assert.equal(payload.roundCount, 3);
   assert.equal(payload.lastRoundId, 'r3');
   assert.equal(payload.lastRoundNumber, 3);
+  assert.equal(payload.lastRoundStatus, 'ended');
   assert.equal(payload.platformFee.effectivePercentage, 10);
   assert.equal('players' in payload, false);
   assert.equal('boxes' in payload, false);
+});
+
+test('buildSessionEndedPayload supports explicit cancelled lastRoundStatus', () => {
+  const payload = buildSessionEndedPayload({
+    eventName: 'session.ended',
+    lastRoundStatus: 'cancelled',
+    session: {
+      sessionId: 's1',
+      stakeAmount: 1000,
+      platformFeeType: 'fixed',
+      platformFeeValueSnapshot: 500,
+      currentExpectedPlayerCount: 5,
+      roundCount: 1,
+      endReason: 'manual_end',
+      endedAt: 20000,
+      status: SessionStatus.CANCELLED
+    },
+    round: {
+      roundId: 'r1',
+      roundNumber: 1,
+      status: RoundStatus.ROUND_CANCELLED,
+      grossStakeTotal: 5000,
+      feeAmount: 500
+    }
+  });
+
+  assert.equal(payload.lastRoundStatus, 'cancelled');
+  assert.equal(payload.status, 'cancelled');
+});
+
+test('session end route rejects requests while a round is already ongoing', async (t) => {
+  const originalGetOrHydrate = sessionRegistry.getOrHydrate;
+  sessionRegistry.getOrHydrate = async () => ({
+    requestSessionEnd: async () => ({
+      ok: false,
+      error: 'ROUND_ONGOING',
+      sessionStatus: SessionStatus.ROUND_ACTIVE,
+      roundStatus: RoundStatus.SWAP_OPEN
+    })
+  });
+
+  const app = createTestApp();
+  const server = http.createServer(app);
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+
+  t.after(async () => {
+    sessionRegistry.getOrHydrate = originalGetOrHydrate;
+    await new Promise((resolve) => server.close(resolve));
+  });
+
+  const address = server.address();
+  const port = typeof address === 'object' && address ? address.port : 0;
+  const response = await fetch(`http://127.0.0.1:${port}/api/sessions/session-1/end`, {
+    method: 'POST'
+  });
+  const payload = await response.json();
+
+  assert.equal(response.status, 409);
+  assert.equal(payload.code, 'ROUND_ONGOING');
+  assert.equal(payload.sessionStatus, SessionStatus.ROUND_ACTIVE);
+  assert.equal(payload.roundStatus, RoundStatus.SWAP_OPEN);
 });
 
 test('validateEnv accepts the current timing config and rejects invalid distribution timings', () => {

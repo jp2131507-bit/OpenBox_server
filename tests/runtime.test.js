@@ -520,6 +520,129 @@ test('join and connection lifecycle emit normalized webhook events', async (t) =
   assert.equal(events.some((entry) => entry.eventName === 'player.reconnected'), true);
 });
 
+test('pre-round lifetime expiry cancels then ends the session with ordered webhooks', async (t) => {
+  withStubbedStore(t);
+  const events = withWebhookCapture(t);
+  withConfigOverride(t, 'sessionInactivityTimeoutMs', 1);
+  const { runtime } = await createRuntimeFixture();
+  t.after(() => clearRuntimeTimers(runtime));
+
+  runtime.session.createdAt = Date.now() - 10;
+  await runtime.handlePreRoundLifetimeExpiry();
+
+  assert.equal(runtime.round.status, RoundStatus.ROUND_CANCELLED);
+  assert.equal(runtime.session.status, SessionStatus.CANCELLED);
+  assert.equal(runtime.session.endReason, 'session_max_lifetime_exceeded');
+  assert.deepEqual(
+    events.map((entry) => entry.eventName),
+    ['round.cancelled', 'session.ended']
+  );
+  assert.equal(events[0].winners.length, 0);
+  assert.equal(events[0].losers.length, 0);
+  assert.equal(events[1].lastRoundStatus, 'cancelled');
+});
+
+test('pre-round lifetime timer is cleared once the round starts', async (t) => {
+  withStubbedStore(t);
+  withConfigOverride(t, 'sessionInactivityTimeoutMs', 60000);
+  const { runtime } = await createRuntimeFixture();
+  t.after(() => clearRuntimeTimers(runtime));
+
+  assert.notEqual(runtime.timers.preRoundLifetime, null);
+
+  await joinAndReadyAll(runtime, ['p1', 'p2', 'p3', 'p4', 'p5']);
+
+  assert.equal(runtime.round.status, RoundStatus.DISTRIBUTING);
+  assert.equal(runtime.timers.preRoundLifetime, null);
+});
+
+test('manual session end before round start cancels then ends', async (t) => {
+  withStubbedStore(t);
+  const events = withWebhookCapture(t);
+  const { runtime } = await createRuntimeFixture();
+  t.after(() => clearRuntimeTimers(runtime));
+
+  const result = await runtime.requestSessionEnd('manual_end');
+
+  assert.equal(result.ok, true);
+  assert.equal(runtime.round.status, RoundStatus.ROUND_CANCELLED);
+  assert.equal(runtime.session.status, SessionStatus.CANCELLED);
+  assert.deepEqual(
+    events.map((entry) => entry.eventName),
+    ['round.cancelled', 'session.ended']
+  );
+  assert.equal(events[1].lastRoundStatus, 'cancelled');
+});
+
+test('manual session end rejects while round is ongoing', async (t) => {
+  withStubbedStore(t);
+  const { runtime } = await createRuntimeFixture();
+  t.after(() => clearRuntimeTimers(runtime));
+
+  await joinAndReadyAll(runtime, ['p1', 'p2', 'p3', 'p4', 'p5']);
+
+  const result = await runtime.requestSessionEnd('manual_end');
+
+  assert.deepEqual(result, {
+    ok: false,
+    error: 'ROUND_ONGOING',
+    sessionStatus: SessionStatus.ROUND_ACTIVE,
+    roundStatus: RoundStatus.DISTRIBUTING
+  });
+});
+
+test('ending an already cancelled round emits only session.ended with cancelled lastRoundStatus', async (t) => {
+  withStubbedStore(t);
+  const events = withWebhookCapture(t);
+  const { runtime } = await createRuntimeFixture();
+  t.after(() => clearRuntimeTimers(runtime));
+
+  runtime.clearAllTimers();
+  runtime.round.status = RoundStatus.ROUND_CANCELLED;
+  runtime.round.roundEndReason = 'joined_below_minimum';
+  runtime.round.endedAt = Date.now();
+  runtime.session.status = SessionStatus.CANCELLED;
+
+  const result = await runtime.requestSessionEnd('manual_end');
+
+  assert.equal(result.ok, true);
+  assert.equal(runtime.session.status, SessionStatus.ENDED);
+  assert.deepEqual(events.map((entry) => entry.eventName), ['session.ended']);
+  assert.equal(events[0].lastRoundStatus, 'cancelled');
+});
+
+test('ending an already ended round emits only session.ended with ended lastRoundStatus', async (t) => {
+  withStubbedStore(t);
+  const events = withWebhookCapture(t);
+  const { runtime } = await createRuntimeFixture();
+  t.after(() => clearRuntimeTimers(runtime));
+
+  runtime.clearAllTimers();
+  runtime.round.status = RoundStatus.ROUND_ENDED;
+  runtime.round.endedAt = Date.now();
+  runtime.session.status = SessionStatus.REPLAY_WAITING;
+
+  const result = await runtime.requestSessionEnd('manual_end');
+
+  assert.equal(result.ok, true);
+  assert.equal(runtime.session.status, SessionStatus.ENDED);
+  assert.deepEqual(events.map((entry) => entry.eventName), ['session.ended']);
+  assert.equal(events[0].lastRoundStatus, 'ended');
+});
+
+test('resumeTimers restores the pre-round lifetime timer for hydrated pre-start sessions', async (t) => {
+  withStubbedStore(t);
+  withConfigOverride(t, 'sessionInactivityTimeoutMs', 60000);
+  const { runtime } = await createRuntimeFixture();
+  t.after(() => clearRuntimeTimers(runtime));
+
+  runtime.clearAllTimers();
+
+  await runtime.resumeTimers();
+
+  assert.notEqual(runtime.timers.preRoundLifetime, null);
+});
+
 test('endSession marks the session ended and clears active index', async (t) => {
   const stub = withStubbedStore(t);
   const { runtime } = await createRuntimeFixture();

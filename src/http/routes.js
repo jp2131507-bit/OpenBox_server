@@ -91,6 +91,41 @@ function buildPublicSessionState(runtime) {
   };
 }
 
+async function handleSessionEndRequest(req, res) {
+  const runtime = await sessionRegistry.getOrHydrate(req.params.sessionId);
+  if (!runtime) {
+    res.status(404).json({ error: 'Session not found' });
+    return;
+  }
+
+  const result = await runtime.requestSessionEnd('manual_end');
+  if (!result.ok) {
+    if (result.error === 'ROUND_ONGOING') {
+      res.status(409).json({
+        error: 'Round is already ongoing',
+        code: result.error,
+        sessionStatus: result.sessionStatus,
+        roundStatus: result.roundStatus
+      });
+      return;
+    }
+
+    res.status(400).json({
+      error: result.error || 'Unable to end session',
+      sessionStatus: result.sessionStatus ?? runtime.session.status,
+      roundStatus: result.roundStatus ?? runtime.round?.status ?? null
+    });
+    return;
+  }
+
+  res.json({
+    ok: true,
+    sessionId: result.sessionId,
+    sessionStatus: result.sessionStatus,
+    roundStatus: result.roundStatus
+  });
+}
+
 router.post('/session/start', requireControlAuth, asyncRoute(async (req, res) => {
   const validation = validateStartPayload(req.body);
   if (!validation.ok) {
@@ -212,15 +247,7 @@ router.post('/session/:sessionId/replay', requireControlAuth, asyncRoute(async (
   });
 }));
 
-router.post('/session/:sessionId/end', requireControlAuth, asyncRoute(async (req, res) => {
-  const runtime = await sessionRegistry.getOrHydrate(req.params.sessionId);
-  if (!runtime) {
-    res.status(404).json({ error: 'Session not found' });
-    return;
-  }
-  await runtime.endSession('manual_end');
-  res.json({ ok: true, sessionId: runtime.session.sessionId });
-}));
+router.post('/session/:sessionId/end', requireControlAuth, asyncRoute(handleSessionEndRequest));
 
 async function handleActiveSessions(req, res) {
   const activeSessionIds = await redisStore.getActiveSessionIds();
@@ -255,20 +282,7 @@ async function handleActiveSessions(req, res) {
 router.get('/admin/sessions/active', requireControlAuth, asyncRoute(handleActiveSessions));
 router.post('/admin/sessions/active', requireControlAuth, asyncRoute(handleActiveSessions));
 
-router.post('/admin/session/:sessionId/end', requireControlAuth, asyncRoute(async (req, res) => {
-  const runtime = await sessionRegistry.getOrHydrate(req.params.sessionId);
-  if (!runtime) {
-    res.status(404).json({ error: 'Session not found' });
-    return;
-  }
-
-  await runtime.endSession('manual_end');
-  res.json({
-    ok: true,
-    sessionId: runtime.session.sessionId,
-    sessionStatus: runtime.session.status
-  });
-}));
+router.post('/admin/session/:sessionId/end', requireControlAuth, asyncRoute(handleSessionEndRequest));
 
 router.get('/admin/session/:sessionId/debug', requireControlAuth, asyncRoute(async (req, res) => {
   const runtime = await sessionRegistry.getOrHydrate(req.params.sessionId);
@@ -465,14 +479,6 @@ router.get('/api/sessions/:sessionId', asyncRoute(async (req, res) => {
   res.json(buildPublicSessionState(runtime));
 }));
 
-router.post('/api/sessions/:sessionId/end', asyncRoute(async (req, res) => {
-  const runtime = await sessionRegistry.getOrHydrate(req.params.sessionId);
-  if (!runtime) {
-    res.status(404).json({ error: 'Session not found' });
-    return;
-  }
-  await runtime.endSession('manual_end');
-  res.json({ ok: true, sessionId: runtime.session.sessionId });
-}));
+router.post('/api/sessions/:sessionId/end', asyncRoute(handleSessionEndRequest));
 
 export default router;

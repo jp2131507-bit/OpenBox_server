@@ -31,6 +31,7 @@ import { send, sendError } from '../ws/wsProtocol.js';
 
 const CONTAINER_SIZE = 12;
 const MAX_PLAYER_NAME_LENGTH = 15;
+const PRE_ROUND_LIFETIME_END_REASON = 'session_max_lifetime_exceeded';
 
 function normalizePlayerName(value) {
   return String(value || '').trim().replace(/\s+/g, ' ').slice(0, MAX_PLAYER_NAME_LENGTH);
@@ -66,6 +67,7 @@ export class SessionRuntime {
     this.swaps = { queue: [], matched: [], keepers: [] };
     this.connections = new Map();
     this.timers = {
+      preRoundLifetime: null,
       joinDeadline: null,
       readyCheck: null,
       distribution: null,
@@ -88,6 +90,65 @@ export class SessionRuntime {
     }
   }
 
+  getLastRoundStatus() {
+    switch (this.round?.status) {
+      case RoundStatus.ROUND_CANCELLED:
+        return 'cancelled';
+      case RoundStatus.ROUND_ENDED:
+        return 'ended';
+      default:
+        return null;
+    }
+  }
+
+  isRoundPreStart(status = this.round?.status) {
+    return [
+      RoundStatus.WAITING_FOR_FIRST_JOIN,
+      RoundStatus.JOIN_WINDOW_OPEN,
+      RoundStatus.READY_CHECK
+    ].includes(status);
+  }
+
+  isRoundStarted(status = this.round?.status) {
+    return [
+      RoundStatus.DISTRIBUTING,
+      RoundStatus.SWAP_OPEN,
+      RoundStatus.SWAP_CLOSED,
+      RoundStatus.ROUND_ENDED
+    ].includes(status);
+  }
+
+  isRoundOngoing(status = this.round?.status) {
+    return [
+      RoundStatus.DISTRIBUTING,
+      RoundStatus.SWAP_OPEN,
+      RoundStatus.SWAP_CLOSED
+    ].includes(status);
+  }
+
+  shouldApplyPreRoundLifetime() {
+    return (
+      config.sessionInactivityTimeoutMs > 0
+      && Number(this.session?.roundCount || 0) <= 1
+      && this.isRoundPreStart()
+    );
+  }
+
+  schedulePreRoundLifetime() {
+    this.clearTimer('preRoundLifetime');
+    if (!this.shouldApplyPreRoundLifetime()) {
+      return;
+    }
+
+    const createdAt = Number(this.session?.createdAt || 0);
+    const deadlineAt = createdAt + config.sessionInactivityTimeoutMs;
+    const remainingMs = Math.max(0, deadlineAt - Date.now());
+    this.timers.preRoundLifetime = setTimeout(() => {
+      this.handlePreRoundLifetimeExpiry().catch((error) => console.error(error));
+    }, remainingMs);
+    this.timers.preRoundLifetime.unref?.();
+  }
+
   async initializeNewRound(round, players) {
     this.clearAllTimers();
     this.round = round;
@@ -97,6 +158,7 @@ export class SessionRuntime {
     this.session.currentRoundId = round.roundId;
     await redisStore.setReplayState(this.session.sessionId, null);
     await this.persistVisibleState();
+    this.schedulePreRoundLifetime();
   }
 
   attachConnection(playerId, ws) {
@@ -166,6 +228,126 @@ export class SessionRuntime {
   async persistVisibleState() {
     this.bumpSnapshotRevision();
     await this.persist();
+  }
+
+  async finalizeSessionClosure({ lastRoundStatus = null } = {}) {
+    const payload = buildSessionEndedPayload({
+      eventName: WebhookEventType.SESSION_ENDED,
+      session: this.session,
+      round: this.round,
+      lastRoundStatus
+    });
+    await dispatchWebhook(WebhookEventType.SESSION_ENDED, payload);
+    await notifyMatchmakingSessionClosed(payload);
+    this.broadcast(ServerMessageType.ERROR, {
+      code: 'SESSION_ENDED',
+      message: this.session.endReason || 'session_ended'
+    });
+    await this.releasePlayerLocks(this.session.registeredPlayerIds);
+    await redisStore.removeActiveSession(this.session.sessionId);
+    return payload;
+  }
+
+  async cancelPreRoundSession(reason, options = {}) {
+    const {
+      minimumPlayersRequired = MINIMUM_PLAYERS_TO_START,
+      emitRoundCancelled = true,
+      eventPayload = {}
+    } = options;
+
+    this.clearAllTimers();
+    if (this.round) {
+      this.round.status = RoundStatus.ROUND_CANCELLED;
+      this.round.roundEndReason = reason;
+      this.round.endedAt = Date.now();
+    }
+    this.session.status = SessionStatus.CANCELLED;
+    this.session.endedAt = Date.now();
+    this.session.endReason = reason;
+    await this.persistVisibleState();
+
+    if (emitRoundCancelled) {
+      await this.appendEvent('round.cancelled', eventPayload);
+      await dispatchWebhook(
+        WebhookEventType.ROUND_CANCELLED,
+        buildRoundCancelledPayload({
+          eventName: WebhookEventType.ROUND_CANCELLED,
+          session: this.session,
+          round: this.round,
+          players: this.players,
+          minimumPlayersRequired
+        })
+      );
+    }
+
+    await this.finalizeSessionClosure({ lastRoundStatus: 'cancelled' });
+    return {
+      ok: true,
+      sessionId: this.session.sessionId,
+      sessionStatus: this.session.status,
+      roundStatus: this.round?.status || null
+    };
+  }
+
+  async handlePreRoundLifetimeExpiry() {
+    if (!this.shouldApplyPreRoundLifetime()) {
+      return;
+    }
+
+    await this.cancelPreRoundSession(PRE_ROUND_LIFETIME_END_REASON, {
+      eventPayload: {
+        reason: PRE_ROUND_LIFETIME_END_REASON,
+        joinedCount: this.getJoinedCount()
+      }
+    });
+  }
+
+  async requestSessionEnd(reason = 'manual_end') {
+    if (this.isRoundOngoing()) {
+      return {
+        ok: false,
+        error: 'ROUND_ONGOING',
+        sessionStatus: this.session.status,
+        roundStatus: this.round?.status || null
+      };
+    }
+
+    if (this.round?.status === RoundStatus.ROUND_CANCELLED) {
+      await this.endSession(reason, { lastRoundStatus: 'cancelled' });
+      return {
+        ok: true,
+        sessionId: this.session.sessionId,
+        sessionStatus: this.session.status,
+        roundStatus: this.round?.status || null
+      };
+    }
+
+    if (this.round?.status === RoundStatus.ROUND_ENDED) {
+      await this.endSession(reason, { lastRoundStatus: 'ended' });
+      return {
+        ok: true,
+        sessionId: this.session.sessionId,
+        sessionStatus: this.session.status,
+        roundStatus: this.round?.status || null
+      };
+    }
+
+    if (this.isRoundPreStart()) {
+      return this.cancelPreRoundSession(reason, {
+        eventPayload: {
+          reason,
+          joinedCount: this.getJoinedCount()
+        }
+      });
+    }
+
+    await this.endSession(reason, { lastRoundStatus: this.getLastRoundStatus() });
+    return {
+      ok: true,
+      sessionId: this.session.sessionId,
+      sessionStatus: this.session.status,
+      roundStatus: this.round?.status || null
+    };
   }
 
   buildWelcome(player) {
@@ -489,38 +671,10 @@ export class SessionRuntime {
 
     const joinedCount = this.getJoinedCount();
     if (joinedCount < MINIMUM_PLAYERS_TO_START) {
-      this.round.status = RoundStatus.ROUND_CANCELLED;
-      this.round.roundEndReason = 'joined_below_minimum';
-      this.round.endedAt = Date.now();
-      this.session.status = SessionStatus.CANCELLED;
-      this.session.endedAt = Date.now();
-      this.session.endReason = 'joined_below_minimum';
-      await this.persistVisibleState();
-      await this.appendEvent('round.cancelled', { joinedCount });
-
-      const sessionEndedPayload = buildSessionEndedPayload({
-        eventName: WebhookEventType.SESSION_ENDED,
-        session: this.session,
-        round: this.round
+      await this.cancelPreRoundSession('joined_below_minimum', {
+        minimumPlayersRequired: MINIMUM_PLAYERS_TO_START,
+        eventPayload: { joinedCount }
       });
-      await dispatchWebhook(
-        WebhookEventType.ROUND_CANCELLED,
-        buildRoundCancelledPayload({
-          eventName: WebhookEventType.ROUND_CANCELLED,
-          session: this.session,
-          round: this.round,
-          players: this.players,
-          minimumPlayersRequired: MINIMUM_PLAYERS_TO_START
-        })
-      );
-      await dispatchWebhook(WebhookEventType.SESSION_ENDED, sessionEndedPayload);
-      await notifyMatchmakingSessionClosed(sessionEndedPayload);
-      this.broadcast(ServerMessageType.ERROR, {
-        code: 'SESSION_ENDED',
-        message: this.round.roundEndReason
-      });
-      await this.releasePlayerLocks(this.session.registeredPlayerIds);
-      await redisStore.removeActiveSession(this.session.sessionId);
       return;
     }
 
@@ -534,6 +688,7 @@ export class SessionRuntime {
 
     this.clearTimer('joinDeadline');
     this.clearTimer('readyCheck');
+    this.clearTimer('preRoundLifetime');
 
     const allocation = buildBoxes({
       registeredPlayerIds: this.round.registeredPlayerIdsForRound,
@@ -1000,6 +1155,8 @@ export class SessionRuntime {
   async resumeTimers(replayState = null) {
     if (!this.round) return;
 
+    this.schedulePreRoundLifetime();
+
     if (this.round.status === RoundStatus.JOIN_WINDOW_OPEN && this.round.joinDeadlineAt) {
       this.scheduleJoinDeadline();
       return;
@@ -1064,24 +1221,14 @@ export class SessionRuntime {
     }
   }
 
-  async endSession(reason) {
+  async endSession(reason, options = {}) {
     this.clearAllTimers();
     this.session.status = SessionStatus.ENDED;
     this.session.endedAt = Date.now();
     this.session.endReason = reason;
     await this.persistVisibleState();
-    const payload = buildSessionEndedPayload({
-      eventName: WebhookEventType.SESSION_ENDED,
-      session: this.session,
-      round: this.round
+    await this.finalizeSessionClosure({
+      lastRoundStatus: options.lastRoundStatus ?? this.getLastRoundStatus()
     });
-    await dispatchWebhook(WebhookEventType.SESSION_ENDED, payload);
-    await notifyMatchmakingSessionClosed(payload);
-    this.broadcast(ServerMessageType.ERROR, {
-      code: 'SESSION_ENDED',
-      message: reason
-    });
-    await this.releasePlayerLocks(this.session.registeredPlayerIds);
-    await redisStore.removeActiveSession(this.session.sessionId);
   }
 }
